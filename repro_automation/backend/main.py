@@ -1,21 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import ipaddress
 import json
+import logging
 import os
 import re
 import subprocess
+import tempfile
 import uuid
+import zipfile
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.background import BackgroundTask
 from sqlalchemy import text
 
 from backend.database import PROJECT_ROOT, engine
@@ -25,13 +31,106 @@ from backend.master_excel import latest_master_workbook, load_customer_site_rows
 from repro_download import REPORT_HEADERS, SITES, MONTHS, report_table_name
 
 app = FastAPI(title="RE.Pro DSM Charge Dashboard API", version="1.0.0")
+LOG = logging.getLogger("repro.dashboard")
+AUTH_REQUIRED = os.getenv("REPRO_AUTH_REQUIRED", "false").strip().casefold() == "true"
+SERVE_FRONTEND = os.getenv("REPRO_SERVE_FRONTEND", "false").strip().casefold() == "true"
+FRONTEND_DIST = Path(os.getenv("REPRO_FRONTEND_DIST", str(Path(__file__).resolve().parents[1] / "frontend" / "dist"))).resolve()
+try:
+    LAN_ALLOWED_NETWORKS = tuple(
+        ipaddress.ip_network(value.strip(), strict=False)
+        for value in os.getenv("REPRO_LAN_ALLOWED_CIDRS", "").split(",")
+        if value.strip()
+    )
+except ValueError as exc:
+    raise RuntimeError("REPRO_LAN_ALLOWED_CIDRS must contain valid IP networks") from exc
+AUTH_USER_HEADER = os.getenv("REPRO_AUTH_USER_HEADER", "X-Authenticated-User").strip()
+AUTH_ROLES_HEADER = os.getenv("REPRO_AUTH_ROLES_HEADER", "X-Authenticated-Roles").strip()
+ADMIN_ROLE = os.getenv("REPRO_ADMIN_ROLE", "DSM-Admin").strip().casefold()
+AUTOMATION_ROLE = os.getenv("REPRO_AUTOMATION_ROLE", "DSM-Users").strip().casefold()
+if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", AUTH_USER_HEADER):
+    raise RuntimeError("REPRO_AUTH_USER_HEADER must be a valid HTTP header name")
+if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", AUTH_ROLES_HEADER):
+    raise RuntimeError("REPRO_AUTH_ROLES_HEADER must be a valid HTTP header name")
+if not ADMIN_ROLE or not AUTOMATION_ROLE:
+    raise RuntimeError("REPRO_ADMIN_ROLE and REPRO_AUTOMATION_ROLE must not be empty")
+trusted_proxy_setting = os.getenv(
+    "REPRO_TRUSTED_PROXY_IPS", "127.0.0.1,::1" if not AUTH_REQUIRED else ""
+)
+TRUSTED_PROXY_IPS = {
+    ipaddress.ip_address(value.strip())
+    for value in trusted_proxy_setting.split(",")
+    if value.strip()
+}
+if AUTH_REQUIRED and not TRUSTED_PROXY_IPS:
+    raise RuntimeError("Set REPRO_TRUSTED_PROXY_IPS to the actual trusted proxy peer IP before enabling authentication")
+cors_origins = [value.strip() for value in os.getenv(
+    "REPRO_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+).split(",") if value.strip()]
+if AUTH_REQUIRED and not cors_origins:
+    raise RuntimeError("Set REPRO_CORS_ORIGINS to the exact authenticated dashboard origin before enabling authentication")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=cors_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+
+
+@app.middleware("http")
+async def trusted_network_identity(request: Request, call_next):
+    """Apply optional LAN allowlisting and trusted-proxy authentication."""
+    # Browser CORS preflights carry no authenticated user identity. Let CORS
+    # handle the preflight; all actual API requests still pass this gate.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if LAN_ALLOWED_NETWORKS:
+        client_host = request.client.host if request.client else ""
+        try:
+            client_ip = ipaddress.ip_address(client_host)
+        except ValueError:
+            client_ip = None
+        if not client_ip or (not client_ip.is_loopback and not any(client_ip in network for network in LAN_ALLOWED_NETWORKS)):
+            return JSONResponse(status_code=403, content={"detail": "This dashboard is available only from the configured company LAN."})
+    if not AUTH_REQUIRED:
+        request.state.principal = "local"
+        request.state.roles = {"local"}
+        return await call_next(request)
+    if request.method == "POST" and request.headers.get("origin") not in cors_origins:
+        return JSONResponse(status_code=403, content={"detail": "The request origin is not allowed for this dashboard."})
+    client_host = request.client.host if request.client else ""
+    try:
+        client_ip = ipaddress.ip_address(client_host)
+    except ValueError:
+        client_ip = None
+    # Local Windows health probes are safe because Uvicorn is bound to loopback.
+    if request.url.path == "/api/health" and client_ip and client_ip.is_loopback:
+        request.state.principal = "service-health-check"
+        request.state.roles = set()
+        return await call_next(request)
+    if client_ip not in TRUSTED_PROXY_IPS:
+        return JSONResponse(status_code=403, content={"detail": "Requests must pass through the trusted company proxy."})
+    principal = request.headers.get(AUTH_USER_HEADER, "").strip()
+    if not principal or len(principal) > 200 or any(ord(char) < 32 for char in principal):
+        return JSONResponse(status_code=401, content={"detail": "Company authentication is required."})
+    role_header = request.headers.get(AUTH_ROLES_HEADER, "")
+    if len(role_header) > 2000 or any(ord(char) < 32 and char not in "\t" for char in role_header):
+        return JSONResponse(status_code=400, content={"detail": "Invalid company role information."})
+    # Keep SSO identities out of the database; a stable digest scopes jobs.
+    request.state.principal = hashlib.sha256(principal.encode("utf-8")).hexdigest()
+    request.state.roles = {role.strip().casefold() for role in re.split(r"[,;]", role_header) if role.strip()}
+    return await call_next(request)
+
+
+def require_admin_role(request: Request) -> None:
+    if AUTH_REQUIRED and ADMIN_ROLE not in getattr(request.state, "roles", set()):
+        raise HTTPException(403, "This action requires the configured dashboard administrator role.")
+
+
+def require_automation_role(request: Request) -> None:
+    roles = getattr(request.state, "roles", set())
+    if AUTH_REQUIRED and not {ADMIN_ROLE, AUTOMATION_ROLE}.intersection(roles):
+        raise HTTPException(403, "Starting downloads requires the configured dashboard user role.")
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -46,6 +145,9 @@ async def helpful_http_error(request: Request, exc: StarletteHTTPException):
 
 @app.get("/")
 def api_root():
+    index = FRONTEND_DIST / "index.html"
+    if SERVE_FRONTEND and index.is_file():
+        return FileResponse(index, media_type="text/html")
     return {"service": "RE.Pro DSM Dashboard API", "docs": "/docs", "health": "/api/health"}
 
 ANALYTIC_ROWS = """(
@@ -59,6 +161,7 @@ ANALYTIC_ROWS = """(
 jobs: dict[str, dict[str, Any]] = {}
 active_combinations: dict[tuple[str, ...], str] = {}
 job_lock = asyncio.Lock()
+automation_execution_lock = asyncio.Lock()
 
 
 def automation_keys(request: AutomationRequest) -> list[tuple[str, ...]]:
@@ -139,17 +242,31 @@ def ensure_master_excel_tables() -> None:
             uploaded_mapping_count INTEGER)"""))
         for name, sql_type in (("uploaded_filename", "TEXT"), ("uploaded_at", "TIMESTAMPTZ"),
                                ("uploaded_status", "TEXT"), ("uploaded_error", "TEXT"),
-                               ("uploaded_mapping_count", "INTEGER")):
+                               ("uploaded_mapping_count", "INTEGER"), ("uploaded_new_count", "INTEGER"),
+                               ("uploaded_updated_count", "INTEGER"), ("uploaded_skipped_count", "INTEGER"),
+                               ("uploaded_total_unique_count", "INTEGER")):
             connection.execute(text(f"ALTER TABLE dashboard_master_excel_config ADD COLUMN IF NOT EXISTS {name} {sql_type}"))
         connection.execute(text("""CREATE TABLE IF NOT EXISTS customer_site_map (
             customer_name TEXT NOT NULL, master_site TEXT NOT NULL, report_site TEXT NOT NULL,
             PRIMARY KEY (customer_name, master_site, report_site))"""))
         connection.execute(text("""CREATE TABLE IF NOT EXISTS master_customer_sites (
-            id BIGSERIAL PRIMARY KEY, customer_key TEXT NOT NULL, location_key TEXT NOT NULL,
+            id BIGSERIAL PRIMARY KEY, customer_key TEXT NOT NULL, site_key TEXT NOT NULL, location_key TEXT NOT NULL,
             customer_name TEXT NOT NULL, location_no TEXT NOT NULL, site_name TEXT NOT NULL,
             name_on_dsm_charges TEXT, group_name TEXT, site_total_capacity_mw_ac NUMERIC(20,6),
             customer_capacity_mw_ac NUMERIC(20,6), report_site TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            CONSTRAINT uq_master_customer_location UNIQUE(customer_key, location_key))"""))
+            CONSTRAINT uq_master_customer_site_location UNIQUE(customer_key, site_key, location_key))"""))
+        connection.execute(text("ALTER TABLE master_customer_sites ADD COLUMN IF NOT EXISTS site_key TEXT"))
+        connection.execute(text("UPDATE master_customer_sites SET site_key=lower(btrim(site_name)) WHERE site_key IS NULL OR site_key=''"))
+        connection.execute(text("ALTER TABLE master_customer_sites ALTER COLUMN site_key SET NOT NULL"))
+        connection.execute(text("ALTER TABLE master_customer_sites DROP CONSTRAINT IF EXISTS uq_master_customer_location"))
+        connection.execute(text("""DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conrelid='public.master_customer_sites'::regclass
+                AND conname='uq_master_customer_site_location') THEN
+                ALTER TABLE public.master_customer_sites
+                    ADD CONSTRAINT uq_master_customer_site_location UNIQUE(customer_key,site_key,location_key);
+            END IF;
+        END $$"""))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_master_customer_sites_report_site ON master_customer_sites(report_site)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_master_customer_sites_customer_key ON master_customer_sites(customer_key)"))
 
@@ -171,6 +288,10 @@ def sync_master_excel_if_changed() -> dict[str, Any]:
         "uploaded_status": config["uploaded_status"] if config else None,
         "uploaded_error": config["uploaded_error"] if config else None,
         "uploaded_mapping_count": config["uploaded_mapping_count"] if config else None,
+        "uploaded_new_count": config["uploaded_new_count"] if config else None,
+        "uploaded_updated_count": config["uploaded_updated_count"] if config else None,
+        "uploaded_skipped_count": config["uploaded_skipped_count"] if config else None,
+        "uploaded_total_unique_count": config["uploaded_total_unique_count"] if config else None,
     }
     if not directory:
         return result
@@ -182,8 +303,8 @@ def sync_master_excel_if_changed() -> dict[str, Any]:
     if source is None:
         result.update(status="file_missing", error=(
             "No valid .xlsx, .xls, or .xlsm Master workbook was found. Each workbook must contain "
-            "Sheet1 with columns B:H: Customer Name, Location No., Site, Name on DSM charges, "
-            "Group, Site Total Capacity (MW-AC), and Customer Capacity (MW-AC)."))
+            "Sheet1 with Customer Name, Location No., Site, Group, Site Total Capacity (MW-AC), "
+            "and Capacity (MW-AC); Name on DSM charges is optional."))
         return result
     stat = source.stat()
     resolved = str(source.resolve())
@@ -192,9 +313,9 @@ def sync_master_excel_if_changed() -> dict[str, Any]:
         result.update(status="current", file_name=source.name)
         return result
     try:
-        mappings, unsupported = load_master_customer_rows(source)
+        mappings, unsupported, duplicate_rows = load_master_customer_rows(source)
         with engine.begin() as connection:
-            persist_master_customer_rows(connection, mappings)
+            sync_summary = persist_master_customer_rows(connection, mappings, duplicate_rows)
             connection.execute(text("""INSERT INTO dashboard_master_excel_config
                 (id,directory,source_path,source_mtime_ns,source_size,synced_at,mapping_count,unsupported_rows,last_error)
                 VALUES (1,:directory,:source_path,:mtime,:size,CURRENT_TIMESTAMP,:count,:unsupported,NULL)
@@ -206,7 +327,8 @@ def sync_master_excel_if_changed() -> dict[str, Any]:
                 "size": stat.st_size, "count": len(mappings), "unsupported": unsupported,
             })
         result.update(directory=str(folder.resolve()), file_name=source.name, synced_at=datetime.now().isoformat(),
-                      mapping_count=len(mappings), unsupported_rows=unsupported, status="synced", error=None)
+                      mapping_count=len(mappings), unsupported_rows=unsupported, status="synced", error=None,
+                      **sync_summary)
     except Exception as exc:
         message = str(exc)[:500]
         with engine.begin() as connection:
@@ -236,35 +358,45 @@ def master_customer_site_data() -> dict[str, Any]:
             "sites": sites, "status": status}
 
 
-def persist_master_customer_rows(connection, records: list[dict[str, Any]]) -> None:
-    """Upsert the new snapshot and remove stale customer/location keys in one transaction."""
+def persist_master_customer_rows(
+    connection, records: list[dict[str, Any]], duplicate_rows_skipped: int = 0
+) -> dict[str, int]:
+    """Incrementally upsert normalized customer/site/location mappings."""
     connection.execute(text("""CREATE TEMP TABLE incoming_master_customer_sites (
-        customer_key TEXT NOT NULL, location_key TEXT NOT NULL, customer_name TEXT NOT NULL,
+        customer_key TEXT NOT NULL, site_key TEXT NOT NULL, location_key TEXT NOT NULL, customer_name TEXT NOT NULL,
         location_no TEXT NOT NULL, site_name TEXT NOT NULL, name_on_dsm_charges TEXT,
         group_name TEXT, site_total_capacity_mw_ac NUMERIC(20,6), customer_capacity_mw_ac NUMERIC(20,6),
         report_site TEXT) ON COMMIT DROP"""))
     stage_sql = text("""INSERT INTO incoming_master_customer_sites
-        (customer_key,location_key,customer_name,location_no,site_name,name_on_dsm_charges,group_name,
+        (customer_key,site_key,location_key,customer_name,location_no,site_name,name_on_dsm_charges,group_name,
          site_total_capacity_mw_ac,customer_capacity_mw_ac,report_site)
-        VALUES (:customer_key,:location_key,:customer_name,:location_no,:site_name,:name_on_dsm_charges,
+        VALUES (:customer_key,:site_key,:location_key,:customer_name,:location_no,:site_name,:name_on_dsm_charges,
          :group_name,:site_total_capacity_mw_ac,:customer_capacity_mw_ac,:report_site)""")
     connection.execute(stage_sql, records)
-    connection.execute(text("""INSERT INTO master_customer_sites
-        (customer_key,location_key,customer_name,location_no,site_name,name_on_dsm_charges,group_name,
+    writes = connection.execute(text("""INSERT INTO master_customer_sites
+        (customer_key,site_key,location_key,customer_name,location_no,site_name,name_on_dsm_charges,group_name,
          site_total_capacity_mw_ac,customer_capacity_mw_ac,report_site,updated_at)
-        SELECT customer_key,location_key,customer_name,location_no,site_name,name_on_dsm_charges,group_name,
+        SELECT customer_key,site_key,location_key,customer_name,location_no,site_name,name_on_dsm_charges,group_name,
          site_total_capacity_mw_ac,customer_capacity_mw_ac,report_site,CURRENT_TIMESTAMP
         FROM incoming_master_customer_sites
-        ON CONFLICT (customer_key,location_key) DO UPDATE SET customer_name=EXCLUDED.customer_name,
+        ON CONFLICT (customer_key,site_key,location_key) DO UPDATE SET customer_name=EXCLUDED.customer_name,
          location_no=EXCLUDED.location_no,site_name=EXCLUDED.site_name,
          name_on_dsm_charges=EXCLUDED.name_on_dsm_charges,group_name=EXCLUDED.group_name,
          site_total_capacity_mw_ac=EXCLUDED.site_total_capacity_mw_ac,
          customer_capacity_mw_ac=EXCLUDED.customer_capacity_mw_ac,report_site=EXCLUDED.report_site,
-         updated_at=CURRENT_TIMESTAMP"""))
-    connection.execute(text("""DELETE FROM master_customer_sites AS target
-        WHERE NOT EXISTS (SELECT 1 FROM incoming_master_customer_sites incoming
-        WHERE incoming.customer_key=target.customer_key AND incoming.location_key=target.location_key)"""))
-    connection.execute(text("DELETE FROM customer_site_map"))
+         updated_at=CURRENT_TIMESTAMP
+        WHERE (master_customer_sites.customer_name,master_customer_sites.location_no,
+               master_customer_sites.site_name,master_customer_sites.name_on_dsm_charges,
+               master_customer_sites.group_name,master_customer_sites.site_total_capacity_mw_ac,
+               master_customer_sites.customer_capacity_mw_ac,master_customer_sites.report_site)
+          IS DISTINCT FROM
+              (EXCLUDED.customer_name,EXCLUDED.location_no,EXCLUDED.site_name,
+               EXCLUDED.name_on_dsm_charges,EXCLUDED.group_name,EXCLUDED.site_total_capacity_mw_ac,
+               EXCLUDED.customer_capacity_mw_ac,EXCLUDED.report_site)
+        RETURNING (xmax=0) AS inserted""")).mappings().all()
+    added = sum(1 for row in writes if row["inserted"])
+    updated = len(writes) - added
+    skipped_existing = len(records) - len(writes)
     mapped = {(row["customer_name"], row["site_name"], row["report_site"])
               for row in records if row["report_site"]}
     if mapped:
@@ -273,14 +405,21 @@ def persist_master_customer_rows(connection, records: list[dict[str, Any]]) -> N
                 {"customer_name": c, "master_site": site, "report_site": report}
                 for c, site, report in sorted(mapped)
             ])
+    total_unique = connection.execute(text("SELECT COUNT(*) FROM master_customer_sites")).scalar_one()
+    return {
+        "new_records_added": added,
+        "existing_records_updated": updated,
+        "duplicate_records_skipped": duplicate_rows_skipped + skipped_existing,
+        "total_unique_records": total_unique,
+    }
 
 
-@app.get("/api/settings/master-excel")
+@app.get("/api/settings/master-excel", dependencies=[Depends(require_admin_role)])
 def get_master_excel_settings():
     return sync_master_excel_if_changed()
 
 
-@app.post("/api/settings/master-excel")
+@app.post("/api/settings/master-excel", dependencies=[Depends(require_admin_role)])
 def save_master_excel_settings(request: MasterExcelSettingsRequest):
     directory = Path(request.directory.strip()).expanduser()
     if not directory.is_dir():
@@ -295,7 +434,7 @@ def save_master_excel_settings(request: MasterExcelSettingsRequest):
     return sync_master_excel_if_changed()
 
 
-@app.post("/api/settings/master-excel/upload")
+@app.post("/api/settings/master-excel/upload", dependencies=[Depends(require_admin_role)])
 async def upload_master_excel(file: UploadFile = File(...)):
     """Upload, validate, and atomically replace the customer/site mapping."""
     original_name = Path(file.filename or "").name
@@ -316,26 +455,35 @@ async def upload_master_excel(file: UploadFile = File(...)):
     temp_path = upload_dir / f".{uuid.uuid4().hex}.upload{suffix}"
     try:
         temp_path.write_bytes(contents)
-        mappings, unsupported = load_master_customer_rows(temp_path)
+        mappings, unsupported, duplicate_rows = load_master_customer_rows(temp_path)
         temp_path.replace(destination)
         with engine.begin() as connection:
-            persist_master_customer_rows(connection, mappings)
+            sync_summary = persist_master_customer_rows(connection, mappings, duplicate_rows)
             connection.execute(text("""INSERT INTO dashboard_master_excel_config
                 (id,directory,synced_at,mapping_count,unsupported_rows,last_error,uploaded_filename,
-                 uploaded_at,uploaded_status,uploaded_error,uploaded_mapping_count)
+                 uploaded_at,uploaded_status,uploaded_error,uploaded_mapping_count,uploaded_new_count,
+                 uploaded_updated_count,uploaded_skipped_count,uploaded_total_unique_count)
                 VALUES (1,:directory,CURRENT_TIMESTAMP,:count,:unsupported,NULL,:filename,
-                        CURRENT_TIMESTAMP,'success',NULL,:count)
+                        CURRENT_TIMESTAMP,'success',NULL,:count,:new_count,:updated_count,:skipped_count,:total_unique)
                 ON CONFLICT (id) DO UPDATE SET synced_at=EXCLUDED.synced_at,
                 mapping_count=EXCLUDED.mapping_count,unsupported_rows=EXCLUDED.unsupported_rows,
                 last_error=NULL,uploaded_filename=EXCLUDED.uploaded_filename,
                 uploaded_at=EXCLUDED.uploaded_at,uploaded_status='success',uploaded_error=NULL,
-                uploaded_mapping_count=EXCLUDED.uploaded_mapping_count"""), {
+                uploaded_mapping_count=EXCLUDED.uploaded_mapping_count,
+                uploaded_new_count=EXCLUDED.uploaded_new_count,
+                uploaded_updated_count=EXCLUDED.uploaded_updated_count,
+                uploaded_skipped_count=EXCLUDED.uploaded_skipped_count,
+                uploaded_total_unique_count=EXCLUDED.uploaded_total_unique_count"""), {
                 "directory": os.getenv("REPRO_MASTER_EXCEL_DIR", "").strip(), "count": len(mappings),
                 "unsupported": unsupported, "filename": original_name,
+                "new_count": sync_summary["new_records_added"],
+                "updated_count": sync_summary["existing_records_updated"],
+                "skipped_count": sync_summary["duplicate_records_skipped"],
+                "total_unique": sync_summary["total_unique_records"],
             })
         return {"status": "success", "uploaded_filename": original_name,
                 "uploaded_at": datetime.now().isoformat(), "mapping_count": len(mappings),
-                "unsupported_rows": unsupported}
+                "unsupported_rows": unsupported, **sync_summary}
     except HTTPException:
         raise
     except Exception as exc:
@@ -344,10 +492,14 @@ async def upload_master_excel(file: UploadFile = File(...)):
         message = str(exc)[:500] or "Could not read the selected Excel workbook"
         with engine.begin() as connection:
             connection.execute(text("""INSERT INTO dashboard_master_excel_config
-                (id,directory,uploaded_filename,uploaded_at,uploaded_status,uploaded_error)
-                VALUES (1,:directory,:filename,CURRENT_TIMESTAMP,'error',:error)
+                (id,directory,uploaded_filename,uploaded_at,uploaded_status,uploaded_error,
+                 uploaded_mapping_count,uploaded_new_count,uploaded_updated_count,
+                 uploaded_skipped_count,uploaded_total_unique_count)
+                VALUES (1,:directory,:filename,CURRENT_TIMESTAMP,'error',:error,NULL,NULL,NULL,NULL,NULL)
                 ON CONFLICT (id) DO UPDATE SET uploaded_filename=EXCLUDED.uploaded_filename,
-                uploaded_at=EXCLUDED.uploaded_at,uploaded_status='error',uploaded_error=EXCLUDED.uploaded_error"""), {
+                uploaded_at=EXCLUDED.uploaded_at,uploaded_status='error',uploaded_error=EXCLUDED.uploaded_error,
+                uploaded_mapping_count=NULL,uploaded_new_count=NULL,uploaded_updated_count=NULL,
+                uploaded_skipped_count=NULL,uploaded_total_unique_count=NULL"""), {
                 "directory": os.getenv("REPRO_MASTER_EXCEL_DIR", "").strip(),
                 "filename": original_name, "error": message,
             })
@@ -378,7 +530,7 @@ def delete_filter(selection: DeleteSelection) -> tuple[str, dict[str, Any]]:
             {"site": selection.site, "start_date": selection.start_date, "end_date": selection.end_date})
 
 
-@app.post("/api/reports/delete-preview")
+@app.post("/api/reports/delete-preview", dependencies=[Depends(require_admin_role)])
 def delete_preview(selection: DeleteSelection):
     where, params = delete_filter(selection)
     rows = execute(f"""SELECT COUNT(DISTINCT e.id) AS report_count, COUNT(r.id) AS daily_row_count
@@ -397,7 +549,7 @@ def scope_has_running_job(selection: DeleteSelection) -> bool:
     return any(key[0] == selection.site for key in active_combinations)
 
 
-@app.post("/api/reports/delete")
+@app.post("/api/reports/delete", dependencies=[Depends(require_admin_role)])
 async def delete_reports(request: DeleteRequest):
     async with job_lock:
         if scope_has_running_job(request):
@@ -709,10 +861,175 @@ def export_daywise(site: str, year: int, month: int):
                     headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename, safe='')}"})
 
 
+def ensure_automation_job_report_table() -> None:
+    with engine.begin() as connection:
+        connection.execute(text("""CREATE TABLE IF NOT EXISTS dashboard_automation_job_reports (
+            job_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+            report_id BIGINT NOT NULL REFERENCES excel_reports(id) ON DELETE CASCADE,
+            linked_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(job_id,report_id))"""))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_dashboard_job_reports_owner ON dashboard_automation_job_reports(owner_id,job_id)"))
+
+
+def associate_job_reports(job_id: str, owner_id: str, request: AutomationRequest,
+                          job: dict[str, Any]) -> int:
+    """Persist links only for reports confirmed successful, skipped, or restored by this job."""
+    ensure_automation_job_report_table()
+    with engine.begin() as connection:
+        for result in job.get("results", []):
+            if result.get("status") not in {"successful", "skipped", "restored"}:
+                continue
+            site = result.get("site")
+            period_label = result.get("period_label", "")
+            report = None
+            custom_period = re.fullmatch(r"\d{4}-\d{2}-\d{2}(?: through \d{4}-\d{2}-\d{2})?", period_label)
+            if custom_period and request.period_type in {"custom", "both"}:
+                report = connection.execute(text("""SELECT id FROM excel_reports
+                    WHERE site=:site AND period_type='custom' AND start_date=:start_date AND end_date=:end_date
+                    ORDER BY downloaded_at DESC LIMIT 1"""), {
+                    "site": site, "start_date": request.start_date, "end_date": request.end_date,
+                }).first()
+            elif request.period_type in {"monthly", "both"} and request.year and result.get("month"):
+                report = connection.execute(text("""SELECT id FROM excel_reports
+                    WHERE site=:site AND period_type='monthly' AND year=:year AND month=:month
+                    ORDER BY downloaded_at DESC LIMIT 1"""), {
+                    "site": site, "year": request.year, "month": result["month"],
+                }).first()
+            if report:
+                connection.execute(text("""INSERT INTO dashboard_automation_job_reports(job_id,owner_id,report_id)
+                    VALUES (:job_id,:owner_id,:report_id) ON CONFLICT (job_id,report_id) DO NOTHING"""), {
+                    "job_id": job_id, "owner_id": owner_id, "report_id": report[0],
+                })
+        return connection.execute(text("SELECT COUNT(*) FROM dashboard_automation_job_reports WHERE job_id=:job_id AND owner_id=:owner_id"), {
+            "job_id": job_id, "owner_id": owner_id,
+        }).scalar_one()
+
+
+def authorized_job_report_count(job_id: str, owner_id: str) -> int:
+    if not re.fullmatch(r"job-[a-f0-9]{12}", job_id):
+        raise HTTPException(404, "Automation job not found")
+    ensure_automation_job_report_table()
+    count = execute("SELECT COUNT(*) AS count FROM dashboard_automation_job_reports WHERE job_id=:job_id AND owner_id=:owner_id",
+                    {"job_id": job_id, "owner_id": owner_id})[0]["count"]
+    if not count:
+        raise HTTPException(404, "No completed reports are available for this job")
+    return count
+
+
+def safe_archive_filename(site: str, period: str, filename: str) -> str:
+    safe_site = re.sub(r"[^A-Za-z0-9._-]+", "_", site).strip("._") or "site"
+    source_name = Path(filename.replace("\\", "/")).name
+    safe_source = re.sub(r"[\x00-\x1f]", "_", source_name).strip(" .") or "report.csv"
+    safe_period = re.sub(r"[^A-Za-z0-9_-]+", "_", period).strip("._") or "report"
+    return f"{safe_site}/{safe_period}_{safe_source}"
+
+
+def delete_job_archive(path: str) -> None:
+    Path(path).unlink(missing_ok=True)
+
+
+@app.get("/api/automation/jobs/{job_id}/files")
+def automation_job_files(job_id: str, request: Request):
+    owner_id = request.state.principal
+    authorized_job_report_count(job_id, owner_id)
+    rows = execute("""SELECT e.site,e.year,e.month,e.period_type,e.start_date,e.end_date,
+        e.original_filename,e.sha256,e.downloaded_at FROM dashboard_automation_job_reports j
+        JOIN excel_reports e ON e.id=j.report_id WHERE j.job_id=:job_id AND j.owner_id=:owner_id
+        ORDER BY e.site,e.year,e.month,e.start_date""", {"job_id": job_id, "owner_id": owner_id})
+    files = []
+    for row in rows:
+        period = (f"{row['year']}-{row['month']:02d}" if row["period_type"] == "monthly"
+                  else f"{row['start_date']} through {row['end_date']}")
+        files.append({"site": row["site"], "period": period,
+                      "filename": Path(row["original_filename"].replace("\\", "/")).name,
+                      "sha256": row["sha256"], "downloaded_at": json_safe(row["downloaded_at"])})
+    return {"job_id": job_id, "file_count": len(files), "files": files}
+
+
+@app.get("/api/automation/jobs/{job_id}/download")
+def download_automation_job_reports(job_id: str, request: Request):
+    owner_id = request.state.principal
+    authorized_job_report_count(job_id, owner_id)
+    export_dir = PROJECT_ROOT / "job_exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    descriptor, archive_path = tempfile.mkstemp(prefix="reports_", suffix=".zip", dir=export_dir)
+    os.close(descriptor)
+    manifest: list[dict[str, Any]] = []
+    try:
+        query = text("""SELECT e.id,e.site,e.year,e.month,e.period_type,e.start_date,e.end_date,
+            e.original_filename,e.sha256,e.content FROM dashboard_automation_job_reports j
+            JOIN excel_reports e ON e.id=j.report_id
+            WHERE j.job_id=:job_id AND j.owner_id=:owner_id ORDER BY e.site,e.year,e.month,e.start_date""")
+        with engine.connect() as connection, zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+            rows = connection.execution_options(stream_results=True).execute(query, {
+                "job_id": job_id, "owner_id": owner_id,
+            }).mappings()
+            for row in rows:
+                period = (f"{row['year']}-{row['month']:02d}" if row["period_type"] == "monthly"
+                          else f"{row['start_date']} through {row['end_date']}")
+                archive_name = safe_archive_filename(row["site"], period, row["original_filename"])
+                archive.writestr(archive_name, bytes(row["content"]))
+                manifest.append({"site": row["site"], "period": period,
+                                 "filename": Path(row["original_filename"].replace("\\", "/")).name,
+                                 "archive_path": archive_name, "sha256": row["sha256"]})
+            archive.writestr("manifest.json", json.dumps({"job_id": job_id, "reports": manifest}, ensure_ascii=False, indent=2))
+        if not manifest:
+            raise HTTPException(404, "No completed reports are available for this job")
+        return FileResponse(archive_path, media_type="application/zip", filename=f"repro_reports_{job_id}.zip",
+                            headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+                            background=BackgroundTask(delete_job_archive, archive_path))
+    except Exception:
+        delete_job_archive(archive_path)
+        raise
+
+
+@app.on_event("startup")
+async def remove_abandoned_job_archives():
+    export_dir = PROJECT_ROOT / "job_exports"
+    if not export_dir.is_dir():
+        return
+    cutoff = datetime.now().timestamp() - 24 * 60 * 60
+    for archive in export_dir.glob("reports_*.zip"):
+        try:
+            if archive.stat().st_mtime < cutoff:
+                archive.unlink(missing_ok=True)
+        except OSError:
+            LOG.warning("Could not remove an expired temporary job archive")
+
+
 def sanitized_line(line: str) -> str:
     # Avoid leaking local absolute paths from subprocess output into API responses.
     line = line.replace(str(PROJECT_ROOT), "<project>").replace(str(PROJECT_ROOT).replace("\\", "/"), "<project>")
     return line[:1200]
+
+
+async def run_downloader_batch(batch: Path, args: list[str], job: dict[str, Any]) -> int:
+    """Run the existing BAT from a worker thread and stream its output safely.
+
+    asyncio.create_subprocess_exec raises WinError 5 in some Windows-hosted
+    Uvicorn environments. subprocess.Popen works there and avoids blocking the
+    API event loop while the downloader runs.
+    """
+    loop = asyncio.get_running_loop()
+    command = "call " + subprocess.list2cmdline([str(batch)]) + " " + subprocess.list2cmdline(args)
+
+    def run_and_stream() -> int:
+        process = subprocess.Popen(
+            ["cmd.exe", "/d", "/s", "/c", command],
+            cwd=PROJECT_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"},
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        assert process.stdout is not None
+        for raw in process.stdout:
+            line = sanitized_line(raw.decode("utf-8", errors="replace").rstrip())
+            if line:
+                loop.call_soon_threadsafe(record_job_line, job, line)
+        return process.wait()
+
+    return await asyncio.to_thread(run_and_stream)
 
 
 def parse_job_event(line: str):
@@ -761,7 +1078,7 @@ def record_job_line(job: dict[str, Any], line: str) -> None:
             job["successful"] += 1
 
 
-async def run_job(job_id: str, request: AutomationRequest):
+async def execute_job(job_id: str, request: AutomationRequest):
     job = jobs[job_id]
     job["status"] = "Running"
     job["started_at"] = datetime.now().astimezone().isoformat()
@@ -778,18 +1095,7 @@ async def run_job(job_id: str, request: AutomationRequest):
     try:
         for args in command_args:
             # Only the allowlisted BAT path and validated structured arguments are used.
-            command = "call " + subprocess.list2cmdline([str(batch)]) + " " + subprocess.list2cmdline(args)
-            process = await asyncio.create_subprocess_exec(
-                "cmd.exe", "/d", "/s", "/c", command, cwd=PROJECT_ROOT,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                env={**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"},
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            async for raw in process.stdout:
-                line = sanitized_line(raw.decode("utf-8", errors="replace").rstrip())
-                if line:
-                    record_job_line(job, line)
-            exit_code = await process.wait()
+            exit_code = await run_downloader_batch(batch, args, job)
             if exit_code:
                 break
         job["exit_code"] = exit_code
@@ -804,8 +1110,22 @@ async def run_job(job_id: str, request: AutomationRequest):
     except Exception as exc:
         job["status"] = "Failed" if job["completed"] == 0 else "Partially Completed"
         job["failed"] += max(0, job["total"] - job["completed"])
-        job["logs"].append(f"Automation could not start: {type(exc).__name__}")
+        error_detail = f"Windows error {exc.winerror}: {exc.strerror}" if isinstance(exc, OSError) and getattr(exc, "winerror", None) else str(getattr(exc, "strerror", "") or "")
+        job["logs"].append(f"Automation could not start: {type(exc).__name__}" + (f" ({error_detail})" if error_detail else ""))
+        LOG.exception("Automation could not start for job_id=%s", job_id)
     finally:
+        owner_id = job.get("owner_id")
+        if owner_id:
+            final_status = job["status"]
+            job["status"] = "Finalizing"
+            try:
+                job["files_ready"] = associate_job_reports(job_id, owner_id, request, job)
+            except Exception as exc:
+                job["files_ready"] = 0
+                job["file_export_error"] = "Completed reports could not be prepared for browser download."
+                job["logs"].append(f"Report download package preparation failed: {type(exc).__name__}")
+                LOG.exception("Could not associate completed reports with job_id=%s", job_id)
+            job["status"] = final_status
         job["finished_at"] = datetime.now().astimezone().isoformat()
         async with job_lock:
             for key in list(active_combinations):
@@ -813,12 +1133,19 @@ async def run_job(job_id: str, request: AutomationRequest):
                     del active_combinations[key]
 
 
+async def run_job(job_id: str, request: AutomationRequest):
+    # A single portal session at a time avoids cross-user session collisions;
+    # site/period keys are reserved as soon as jobs are accepted.
+    async with automation_execution_lock:
+        await execute_job(job_id, request)
+
+
 def schedule_job(job_id: str, request: AutomationRequest):
     return asyncio.create_task(run_job(job_id, request))
 
 
-@app.post("/api/automation/start", status_code=202)
-async def start_automation(request: AutomationRequest):
+@app.post("/api/automation/start", status_code=202, dependencies=[Depends(require_automation_role)])
+async def start_automation(request: AutomationRequest, http_request: Request):
     async with job_lock:
         keys = automation_keys(request)
         overlaps = [key for key in keys if key in active_combinations]
@@ -829,7 +1156,9 @@ async def start_automation(request: AutomationRequest):
         jobs[job_id] = {"job_id": job_id, "status": "Queued", "total": total, "completed": 0,
                         "successful": 0, "downloaded": 0, "imported": 0, "restored": 0,
                         "skipped": 0, "failed": 0, "current_site": None,
-                        "current_month": None, "current_period": None, "results": [], "logs": [], "created_at": datetime.now().astimezone().isoformat()}
+                        "current_month": None, "current_period": None, "results": [], "logs": [],
+                        "files_ready": 0, "owner_id": http_request.state.principal,
+                        "created_at": datetime.now().astimezone().isoformat()}
         for key in keys:
             active_combinations[key] = job_id
         schedule_job(job_id, request)
@@ -837,19 +1166,42 @@ async def start_automation(request: AutomationRequest):
 
 
 @app.get("/api/automation/status/{job_id}")
-def automation_status(job_id: str):
+def automation_status(job_id: str, request: Request):
     if job_id not in jobs:
         raise HTTPException(404, "Automation job not found")
-    return {k: v for k, v in jobs[job_id].items() if k != "logs"}
+    if jobs[job_id].get("owner_id", "local") != request.state.principal:
+        raise HTTPException(404, "Automation job not found")
+    return {k: v for k, v in jobs[job_id].items() if k not in {"logs", "owner_id"}}
 
 
 @app.get("/api/automation/logs/{job_id}")
-def automation_logs(job_id: str):
+def automation_logs(job_id: str, request: Request):
     if job_id not in jobs:
+        raise HTTPException(404, "Automation job not found")
+    if jobs[job_id].get("owner_id", "local") != request.state.principal:
         raise HTTPException(404, "Automation job not found")
     return {"job_id": job_id, "logs": jobs[job_id]["logs"]}
 
 
 @app.get("/api/automation/jobs")
-def automation_jobs():
-    return list(reversed([{k: v for k, v in job.items() if k != "logs"} for job in jobs.values()]))
+def automation_jobs(request: Request):
+    return list(reversed([{k: v for k, v in job.items() if k not in {"logs", "owner_id"}}
+                          for job in jobs.values() if job.get("owner_id", "local") == request.state.principal]))
+
+
+@app.get("/{asset_path:path}", include_in_schema=False)
+def frontend_asset_or_route(asset_path: str):
+    """Serve the built React app and its assets when explicitly enabled."""
+    if not SERVE_FRONTEND or asset_path.startswith(("api/", "docs", "redoc", "openapi.json")):
+        raise HTTPException(404, "Not Found")
+    candidate = (FRONTEND_DIST / asset_path).resolve()
+    try:
+        candidate.relative_to(FRONTEND_DIST)
+    except ValueError:
+        raise HTTPException(404, "Not Found") from None
+    if candidate.is_file():
+        return FileResponse(candidate)
+    index = FRONTEND_DIST / "index.html"
+    if index.is_file():
+        return FileResponse(index, media_type="text/html")
+    raise HTTPException(404, "Dashboard build is missing; build frontend/dist first.")

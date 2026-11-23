@@ -5,4 +5,9 @@ frontend/dist/
 __pycache__/
 .pytest_cache/
 artifacts/
+job_exports/
+backups/
+logs/
+deployment/Caddyfile.production
+deployment/Caddyfile.production.*
 download_errors.log

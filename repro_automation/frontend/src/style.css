@@ -80,3 +80,5 @@ main{height:calc(100vh - 82px);padding:12px 22px 16px;max-width:1900px;margin:0 
 .top-grid .recharts-line path[stroke="#6d28d9"]{stroke:var(--accent-purple)}
 .revenue-card .recharts-pie-sector:nth-child(1) path{fill:var(--accent-green)}
 .revenue-card .recharts-pie-sector:nth-child(2) path{fill:var(--accent-red)}
+
+.job-download-button,.download-toast-action{border:1px solid #00CFFF;border-radius:7px;background:#073b55;color:#fff;display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:7px 10px;font-size:10px;font-weight:800;cursor:pointer}.job-download-button{margin-top:9px}.job-download-button:hover,.download-toast-action:hover{background:#0b5876}.toast .download-toast-action{white-space:nowrap;margin-left:auto}

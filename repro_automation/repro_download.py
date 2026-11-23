@@ -35,6 +35,7 @@ DB_PATH = Path(os.getenv("REPRO_DB_PATH", "reports.sqlite3"))
 SQLITE_PATH = Path(os.getenv("REPRO_SQLITE_PATH", str(DB_PATH)))
 DB_BACKEND = os.getenv("REPRO_DB_BACKEND", "postgres").strip().lower()
 DOWNLOAD_DIR = Path(os.getenv("REPRO_DOWNLOAD_DIR", "downloads"))
+ERROR_LOG = Path(os.getenv("REPRO_ERROR_LOG", "download_errors.log"))
 HEADLESS = os.getenv("REPRO_HEADLESS", "false").lower() == "true"
 LOG = logging.getLogger("repro")
 
@@ -829,7 +830,8 @@ async def main():
         raise SystemExit("Do not combine --delete-all-reports with --site or --months")
     if args.restore_files_only and (args.all or args.site or args.sites or custom_requested or args.db_check or args.db_list or args.migrate_sqlite or args.sync_report_rows or delete_action):
         raise SystemExit("Use --restore-files-only by itself")
-    logging.basicConfig(filename="download_errors.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(filename=ERROR_LOG, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.db_check or args.db_list or args.migrate_sqlite or args.sync_report_rows or delete_action:
         con = database()
         try:

@@ -1,0 +1,31 @@
+{
+	admin off
+}
+
+https://{{DASHBOARD_HOST}} {
+	bind {{SERVER_LAN_IP}}
+	tls {{TLS_CERT_PATH}} {{TLS_KEY_PATH}}
+	encode zstd gzip
+	@untrusted not remote_ip {{TRUSTED_GATEWAY_IPS}}
+	respond @untrusted "Forbidden" 403
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+	route {
+		@api path /api /api/*
+		reverse_proxy @api 127.0.0.1:8000
+		root * {{WEB_ROOT}}
+		try_files {path} /index.html
+		file_server
+	}
+	log {
+		output file {{ACCESS_LOG}} {
+			roll_size 10MiB
+			roll_keep 10
+		}
+		format json
+	}
+}

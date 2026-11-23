@@ -131,7 +131,7 @@ def _capacity(value: Any, field_name: str) -> Decimal | None:
     return number
 
 
-def load_master_customer_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
+def load_master_customer_rows(path: Path) -> tuple[list[dict[str, Any]], int, int]:
     """Read the B:G Master layout, with an optional DSM-name column at E."""
     try:
         frame = pd.read_excel(path, sheet_name="Sheet1", dtype=object)
@@ -175,8 +175,9 @@ def load_master_customer_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
             )
         dsm_index, group_index, site_capacity_index, customer_capacity_index = None, 4, 5, 6
 
-    records: dict[tuple[str, str], dict[str, Any]] = {}
+    records: dict[tuple[str, str, str], dict[str, Any]] = {}
     unmapped = 0
+    duplicate_rows = 0
     for row_number, source_row in enumerate(frame.itertuples(index=False, name=None), start=2):
         customer_value, location_value, site_value = source_row[1], source_row[2], source_row[3]
         dsm_site_value = source_row[dsm_index] if dsm_index is not None else None
@@ -190,6 +191,9 @@ def load_master_customer_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
         location_no = _cell_text(location_value)
         site_name = _cell_text(site_value)
         dsm_site = _cell_text(dsm_site_value)
+        if not customer and not site_name:
+            # Ignore non-record footer values (for example workbook totals).
+            continue
         if not customer or not site_name:
             raise ValueError(f"Master row {row_number} must include Customer Name (B) and Site (D)")
         # Prefer the explicit DSM label when supplied; otherwise map the Site column.
@@ -200,6 +204,7 @@ def load_master_customer_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
             # Some non-report rows in the supplied workbook have no Location No.; use
             # that customer's normalized site as a stable identity for those rows.
             "customer_key": customer.casefold(),
+            "site_key": site_name.casefold(),
             "location_key": location_no.casefold() if location_no else f"site:{normalize_header(site_name)}",
             "customer_name": customer, "location_no": location_no, "site_name": site_name,
             "name_on_dsm_charges": dsm_site or None, "group_name": _cell_text(group_value) or None,
@@ -207,9 +212,10 @@ def load_master_customer_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
             "customer_capacity_mw_ac": _capacity(customer_cap_value, "Customer Capacity (MW-AC)"),
             "report_site": report_site,
         }
-        key = (row["customer_key"], row["location_key"])
+        key = (row["customer_key"], row["site_key"], row["location_key"])
         prior = records.get(key)
         if prior:
+            duplicate_rows += 1
             conflicts = [field for field in row if field != "customer_capacity_mw_ac" and prior[field] != row[field]]
             if conflicts:
                 raise ValueError(
@@ -235,4 +241,4 @@ def load_master_customer_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
             records[key] = row
     if not records:
         raise ValueError("Sheet1 contains no usable customer/location rows")
-    return list(records.values()), unmapped
+    return list(records.values()), unmapped, duplicate_rows
