@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$ListenAddress = '192.168.41.199',
-    [ValidateRange(1024, 65535)][int]$Port = 8080
+    [ValidateRange(1024, 65535)][int]$Port = 8080,
+    [string[]]$AdditionalAllowedCidrs = @('192.168.2.0/24')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,6 +46,20 @@ $networkOctets = foreach ($octet in $octets) {
     [string]$networkOctet
 }
 $allowedCidr = ($networkOctets -join '.') + '/' + [string]$adapterAddress.PrefixLength
+$additionalNetworks = @($AdditionalAllowedCidrs | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+foreach ($network in $additionalNetworks) {
+    $parts = $network -split '/', 2
+    $networkIp = $null
+    $prefixLength = 0
+    if ($parts.Count -ne 2 -or -not [System.Net.IPAddress]::TryParse($parts[0], [ref]$networkIp)) {
+        throw "Invalid AdditionalAllowedCidrs entry: $network"
+    }
+    $maxPrefix = if ($networkIp.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { 32 } else { 128 }
+    if (-not [int]::TryParse($parts[1], [ref]$prefixLength) -or $prefixLength -lt 0 -or $prefixLength -gt $maxPrefix) {
+        throw "Invalid prefix in AdditionalAllowedCidrs entry: $network"
+    }
+}
+$allowedCidrs = @($allowedCidr) + $additionalNetworks | Select-Object -Unique
 
 $listener = Get-NetTCPConnection -State Listen -LocalAddress $ListenAddress -LocalPort $Port -ErrorAction SilentlyContinue
 if ($listener) { throw "Port $Port is already listening on $ListenAddress (PID $($listener[0].OwningProcess))." }
@@ -52,12 +67,12 @@ if ($listener) { throw "Port $Port is already listening on $ListenAddress (PID $
 # This explicit LAN mode grants dashboard access to every device in the adapter subnet.
 $env:REPRO_SERVE_FRONTEND = 'true'
 $env:REPRO_FRONTEND_DIST = (Join-Path $projectRoot 'frontend\dist')
-$env:REPRO_LAN_ALLOWED_CIDRS = $allowedCidr
+$env:REPRO_LAN_ALLOWED_CIDRS = $allowedCidrs -join ','
 $env:REPRO_AUTH_REQUIRED = 'false'
 $env:PLAYWRIGHT_NODEJS_PATH = $nodeCommand.Source
 
 Write-Host "RE.Pro DSM Dashboard: http://${ListenAddress}:$Port"
-Write-Host "LAN access restriction: $allowedCidr (plus this machine's loopback)"
+Write-Host "LAN access restriction: $($allowedCidrs -join ', ') (plus this machine's loopback)"
 Write-Host "Playwright Node.js: $($nodeCommand.Source)"
 Write-Host 'Keep this PowerShell window open. Press Ctrl+C to stop the dashboard.'
 Write-Host 'Windows Firewall rules are not changed by this script.'

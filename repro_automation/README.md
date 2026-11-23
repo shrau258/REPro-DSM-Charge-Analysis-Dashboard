@@ -15,13 +15,15 @@ This project keeps the existing Playwright downloader and adds a PostgreSQL-back
 
 ### Direct LAN run on this Windows machine
 
-For a temporary direct-IP run without a login, use `start_lan_dashboard.ps1` from the project root. It serves the existing `frontend/dist` build and the FastAPI endpoints together on the selected machine IP (default `192.168.41.199`) at port `8080`. It derives an allowlisted CIDR from the selected network adapter and binds only to that IP. Keep the PowerShell window open; press Ctrl+C to stop it.
+For a temporary direct-IP run without a login, use `start_lan_dashboard.ps1` from the project root. It serves the existing `frontend/dist` build and the FastAPI endpoints together on the selected machine IP (default `192.168.41.199`) at port `8080`. It derives an allowlisted CIDR from the selected network adapter, also allows the confirmed company subnet `192.168.2.0/24`, and binds only to the selected IP. Keep the PowerShell window open; press Ctrl+C to stop it.
 
 ```powershell
 Set-Location 'C:\path\to\repro_automation'
 .\start_lan_dashboard.ps1
 # Or specify a different IPv4 assigned to this machine:
 .\start_lan_dashboard.ps1 -ListenAddress '192.168.41.199' -Port 8080
+# Add any other IT-approved routed client subnets when required:
+.\start_lan_dashboard.ps1 -AdditionalAllowedCidrs @('192.168.2.0/24','192.168.41.0/24')
 ```
 
 This direct mode has no authentication: every device that can reach the allowed subnet can use dashboard features, including Settings, master uploads, report deletion, and downloads. Use it only on the approved internal LAN. The launcher does not change Windows Firewall; if another computer cannot connect, have IT review the inbound TCP 8080 rule and LAN policy. This temporary run does not install a Windows service and stops when its PowerShell process exits. For persistent hosting, use the authenticated Caddy/service deployment below.

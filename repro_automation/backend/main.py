@@ -803,11 +803,21 @@ def sitewise_percentage(sites: list[str] = Query(default=[]), start_date: date |
 
 
 @app.get("/api/revenue/breakdown")
-def revenue_breakdown(sites: list[str] = Query(default=[]), start_date: date | None = None,
-                      end_date: date | None = None):
-    where, params = parse_filters(sites, start_date, end_date)
-    rows = execute(f"SELECT SUM(gross_revenue_inr) AS gross,SUM(dsm_charges_inr) AS charges "
-                   f"FROM {ANALYTIC_ROWS}{where}", params)
+def revenue_breakdown(site: str, year: int, month: int):
+    if site not in SITES or year not in range(2000, 2101) or month not in range(1, 13):
+        raise HTTPException(422, "Invalid site, year, or month")
+    report = report_record(site, year, month)
+    if not report:
+        raise HTTPException(404, "No data available for the selected site, month, and year.")
+    # Use one report_id from the exact monthly report. Do not query the
+    # cross-report analytics CTE, which intentionally combines date ranges.
+    rows = execute("""SELECT COUNT(*) AS row_count,SUM(gross_revenue_inr) AS gross,
+        SUM(dsm_charges_inr) AS charges FROM excel_report_rows
+        WHERE report_id=:report_id AND site=:site AND year=:year AND month=:month""", {
+        "report_id": report["id"], "site": site, "year": year, "month": month,
+    })
+    if not rows[0]["row_count"]:
+        raise HTTPException(404, "No data available for the selected site, month, and year.")
     gross, charges = rows[0]["gross"], rows[0]["charges"]
     return {key: json_safe(value) for key, value in revenue_metrics(gross, charges).items()}
 
