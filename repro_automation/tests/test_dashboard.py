@@ -61,17 +61,9 @@ def test_custom_single_date_progress_event_is_recognized():
 
 
 def test_background_both_mode_runs_headless_month_and_custom_commands(monkeypatch):
-    class Stream:
-        def __init__(self, lines): self.lines = lines
-        async def __aiter__(self):
-            for line in self.lines:
-                yield line.encode("utf-8")
-    class Process:
-        def __init__(self, lines): self.stdout=Stream(lines)
-        async def wait(self): return 0
     calls=[]
-    async def fake_create(*args, **kwargs):
-        calls.append((args,kwargs))
+    async def fake_run(batch, args, job):
+        calls.append((batch, args))
         lines=(
             ["STARTING zaheerabad April 2026", "DOWNLOADED zaheerabad April 2026",
              "IMPORTED zaheerabad April 2026", "SUCCESSFUL zaheerabad April 2026"]
@@ -81,8 +73,10 @@ def test_background_both_mode_runs_headless_month_and_custom_commands(monkeypatc
              "IMPORTED zaheerabad 2026-04-12 through 2026-04-12",
              "SUCCESSFUL zaheerabad 2026-04-12 through 2026-04-12"]
         )
-        return Process(lines)
-    monkeypatch.setattr(main.asyncio,"create_subprocess_exec",fake_create)
+        for line in lines:
+            main.record_job_line(job, line)
+        return 0
+    monkeypatch.setattr(main, "run_downloader_batch", fake_run)
     request=AutomationRequest(sites=[SITES[0]],period_type="both",year=2026,months=[4],
                               start_date=date(2026,4,12),end_date=date(2026,4,12))
     main.jobs["background-test"]={"job_id":"background-test","total":2,"completed":0,"successful":0,
@@ -90,8 +84,10 @@ def test_background_both_mode_runs_headless_month_and_custom_commands(monkeypatc
     asyncio.run(main.run_job("background-test",request))
     job=main.jobs.pop("background-test")
     assert len(calls)==2
-    assert all("--headless" in call[0][-1] for call in calls)
-    assert all("creationflags" in call[1] for call in calls)
+    assert all("--headless" in args for _, args in calls)
+    assert calls[0][1][0:2] == ["--sites", "zaheerabad"]
+    assert "--months" in calls[0][1] and "April" in calls[0][1]
+    assert "--from-date" in calls[1][1] and "--to-date" in calls[1][1]
     assert job["status"]=="Completed" and job["completed"]==2 and job["imported"]==2
 
 
@@ -148,8 +144,15 @@ def test_daywise_query_uses_daily_group_and_inclusive_date_filters(monkeypatch, 
 
 
 def test_revenue_api_aggregates_money_before_percent(monkeypatch, client):
-    monkeypatch.setattr(main, "execute", lambda *a, **k: [{"gross": Decimal("1000"), "charges": Decimal("25")}])
-    result = client.get("/api/revenue/breakdown?sites=zaheerabad").json()
+    seen = {}
+    monkeypatch.setattr(main, "report_record", lambda *args: {"id": 42})
+    def fake_execute(sql, params=None):
+        seen.update(sql=sql, params=params)
+        return [{"row_count": 2, "gross": Decimal("1000"), "charges": Decimal("25")}]
+    monkeypatch.setattr(main, "execute", fake_execute)
+    result = client.get("/api/revenue/breakdown?site=zaheerabad&year=2026&month=10").json()
+    assert "WHERE report_id=:report_id AND site=:site AND year=:year AND month=:month" in seen["sql"]
+    assert seen["params"] == {"report_id": 42, "site": "zaheerabad", "year": 2026, "month": 10}
     assert result["net_revenue"] == 975
     assert result["dsm_charge_percent"] == 2.5
     assert result["net_revenue_percent"] == 97.5

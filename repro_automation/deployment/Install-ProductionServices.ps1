@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$ProjectRoot = '',
     [Parameter(Mandatory = $true)][string]$NssmPath,
     [Parameter(Mandatory = $true)][string]$CaddyPath,
     [Parameter(Mandatory = $true)][string]$DashboardHost,
@@ -9,6 +9,12 @@ param(
     [Parameter(Mandatory = $true)][string]$TlsCertificatePath,
     [Parameter(Mandatory = $true)][string]$TlsPrivateKeyPath
 )
+
+$deploymentScriptPath = $PSCommandPath
+if ([string]::IsNullOrWhiteSpace($deploymentScriptPath)) { $deploymentScriptPath = $MyInvocation.MyCommand.Path }
+if ([string]::IsNullOrWhiteSpace($deploymentScriptPath)) { throw 'Cannot determine this deployment script path. Run the .ps1 file directly.' }
+$deploymentScriptDirectory = Split-Path -Parent $deploymentScriptPath
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $deploymentScriptDirectory }
 
 $ErrorActionPreference = 'Stop'
 $ApiService = 'EnrichDSMApi'
@@ -108,8 +114,8 @@ foreach ($entry in $gatewayEntries) {
 
 $Logs = Join-Path $ProjectRoot 'logs'
 New-Item -ItemType Directory -Path $Logs -Force | Out-Null
-$TemplatePath = Join-Path $PSScriptRoot 'Caddyfile.template'
-$CaddyfilePath = Join-Path $PSScriptRoot 'Caddyfile.production'
+$TemplatePath = Join-Path $deploymentScriptDirectory 'Caddyfile.template'
+$CaddyfilePath = Join-Path $deploymentScriptDirectory 'Caddyfile.production'
 $template = Get-Content -LiteralPath $TemplatePath -Raw
 $replacements = @{
     '{{DASHBOARD_HOST}}' = $DashboardHost

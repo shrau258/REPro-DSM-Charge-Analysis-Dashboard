@@ -1,9 +1,13 @@
 [CmdletBinding()]
 param([string]$DashboardUrl = '')
+$deploymentScriptPath = $PSCommandPath
+if ([string]::IsNullOrWhiteSpace($deploymentScriptPath)) { $deploymentScriptPath = $MyInvocation.MyCommand.Path }
+if ([string]::IsNullOrWhiteSpace($deploymentScriptPath)) { throw 'Cannot determine this deployment script path. Run the .ps1 file directly.' }
+$deploymentScriptDirectory = Split-Path -Parent $deploymentScriptPath
 $ErrorActionPreference = 'Stop'
 $api = Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/health' -TimeoutSec 10
 if ($api.status -ne 'ok') { throw 'FastAPI did not report a healthy PostgreSQL connection.' }
-$indexPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'frontend\dist\index.html'
+$indexPath = Join-Path (Split-Path -Parent $deploymentScriptDirectory) 'frontend\dist\index.html'
 if (-not (Test-Path -LiteralPath $indexPath) -or (Get-Content -LiteralPath $indexPath -Raw) -notmatch '<div id="root"></div>') {
     throw 'The production dashboard build is missing or invalid.'
 }

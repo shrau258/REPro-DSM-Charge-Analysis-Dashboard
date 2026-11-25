@@ -1,5 +1,12 @@
 [CmdletBinding()]
-param([string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot))
+param([string]$ProjectRoot = '')
+
+$deploymentScriptPath = $PSCommandPath
+if ([string]::IsNullOrWhiteSpace($deploymentScriptPath)) { $deploymentScriptPath = $MyInvocation.MyCommand.Path }
+if ([string]::IsNullOrWhiteSpace($deploymentScriptPath)) { throw 'Cannot determine this deployment script path. Run the .ps1 file directly.' }
+$deploymentScriptDirectory = Split-Path -Parent $deploymentScriptPath
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $deploymentScriptDirectory }
+
 $ErrorActionPreference = 'Stop'
 $frontend = Join-Path (Resolve-Path -LiteralPath $ProjectRoot).Path 'frontend'
 Push-Location $frontend

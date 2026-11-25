@@ -26,7 +26,53 @@ Set-Location 'C:\path\to\repro_automation'
 .\start_lan_dashboard.ps1 -AdditionalAllowedCidrs @('192.168.2.0/24','192.168.41.0/24')
 ```
 
-This direct mode has no authentication: every device that can reach the allowed subnet can use dashboard features, including Settings, master uploads, report deletion, and downloads. Use it only on the approved internal LAN. The launcher does not change Windows Firewall; if another computer cannot connect, have IT review the inbound TCP 8080 rule and LAN policy. This temporary run does not install a Windows service and stops when its PowerShell process exits. For persistent hosting, use the authenticated Caddy/service deployment below.
+This direct mode has no authentication: every device that can reach the allowed subnet can use dashboard features, including Settings, master uploads, report deletion, and downloads. Use it only on the approved internal LAN. The launcher does not change Windows Firewall; if another computer cannot connect, have IT review the inbound TCP 8080 rule and LAN policy. This temporary run does not install a Windows service and stops when its PowerShell process exits.
+
+### NSSM service for the existing direct-IP dashboard
+
+To keep the current IP-based dashboard running after reboot and without an interactive login, install the NSSM service from an elevated PowerShell window. The service supervises `deployment/Start-LanDashboardService.ps1`, which waits for PostgreSQL and the configured LAN IP, then calls `start_lan_dashboard.ps1 -ServiceMode`. The launcher supervises Uvicorn, probes FastAPI/PostgreSQL every 30 seconds, and restarts an exited or repeatedly unhealthy application with bounded backoff. That launcher serves the production Vite build and FastAPI on `192.168.41.199:8080`; the application allowlist remains exactly `192.168.2.0/24` and `192.168.41.0/24`. No Caddy, Docker, Task Scheduler, firewall, or PostgreSQL data changes are made.
+
+```powershell
+Set-Location 'C:\Users\scadacc1\Downloads\REPro_Python_Backend\repro_automation'
+$Nssm = 'C:\nssm\nssm.exe\win64\ssm.exe'
+$BrowserCache = 'C:\Users\scadacc1\AppData\Local\ms-playwright'
+Test-Path -LiteralPath $Nssm
+& $Nssm version
+.\deployment\Install-LanDashboardService.ps1 -ProjectRoot (Get-Location).Path -NssmPath $Nssm -ListenAddress '192.168.41.199' -Port 8080 -PostgresServiceName 'postgresql-x64-18' -BrowserCachePath $BrowserCache
+```
+
+The installer derives the virtual service identity from the actual service name and preserves the existing `NT SERVICE\EnrichDSMDashboard` account. It safely removes the obsolete `EnrichDSMDashboardPreflight` helper only when that service is registered to the configured NSSM executable. PostgreSQL/IP readiness and the bounded, non-downloading Python CLI, BAT argument-forwarding, and Chromium launch checks now run during the real dashboard service startup, before Uvicorn, using the production service identity and NSSM environment. These checks do not submit a portal download or write report rows. The service uses delayed automatic startup, PostgreSQL dependency/readiness checks, duplicate prevention, restart-on-failure, process-tree cleanup, Node/Playwright paths, least-privilege directory ACLs, and rotated logs. The installer grants the service account directory-only traverse/read-attributes permission on runtime path ancestors, without inheriting access to sibling files. Make sure the service identity can read any separately configured Master Excel folder.
+
+Check status and PostgreSQL/API health:
+
+```powershell
+Get-Service EnrichDSMDashboard
+sc.exe qc EnrichDSMDashboard
+Invoke-RestMethod 'http://192.168.41.199:8080/api/health'
+Invoke-WebRequest 'http://192.168.41.199:8080/' -UseBasicParsing
+.\deployment\Get-LanDashboardStatus.ps1
+```
+
+Open `http://192.168.41.199:8080` from another company LAN computer. Then close PowerShell and VS Code and repeat the page/API checks. The service listens on the same URL after reboot. Restart or inspect it with:
+
+```powershell
+Restart-Service EnrichDSMDashboard
+Get-Content .\logs\lan-service.log -Tail 80
+Get-Content .\logs\lan-service-error.log -Tail 80
+Select-String -Path .\logs\lan-service.log,.\logs\lan-service-error.log -Pattern 'preflight|Chromium|AUTOMATION PREFLIGHT' | Select-Object -Last 50
+Get-Content .\logs\service-supervisor.log -Tail 80
+Get-Content .\logs\uvicorn-error.log -Tail 80
+```
+
+To remove only the Windows service while retaining project files, downloads, logs, and PostgreSQL records, use elevated PowerShell:
+
+```powershell
+.\deployment\Remove-LanDashboardService.ps1 -NssmPath $Nssm
+```
+
+The manual fallback remains available when the service is stopped: `.\start_lan_dashboard.ps1 -ListenAddress '192.168.41.199' -Port 8080 -AdditionalAllowedCidrs @('192.168.2.0/24','192.168.41.0/24')`.
+
+Windows lock/logout does not stop a correctly installed service. Windows shutdown or sleep does stop hosting; change power policy only with company IT approval. The dashboard is unavailable while its host is powered off or disconnected. For truly independent 24/7 availability, stage the application on an always-on company server/VM, configure a unique reserved IP or stable internal DNS name, install compatible Python/Node/PostgreSQL client tools and Playwright Chromium in managed directories, copy private configuration using the approved secret process, restore a verified database dump into a new database, then install and run the same non-destructive service preflight. Never assign `192.168.41.199` to two machines.
 
 Production uses the compiled Vite site; it does not run the Vite development server. The intended request path is:
 
@@ -146,14 +192,20 @@ Get-Content .\logs\caddy-access.jsonl -Tail 50
 Use the backup script regularly and store the resulting custom-format database dump on an IT-approved protected backup target:
 
 ```powershell
-Set-Location $env:DSM_PROJECT_ROOT
-.\deployment\Backup-Postgres.ps1
+Set-Location 'C:\Users\scadacc1\Downloads\REPro_Python_Backend\repro_automation'
+.\deployment\Backup-Postgres.ps1 -BackupDirectory 'D:\ApprovedBackups\REPro'
 ```
 
-PostgreSQL prompts securely if no approved password file/credential helper is configured; the scripts never place a password in command arguments or output. For recovery, create a new empty target database first, point a protected recovery `.env` at it, then explicitly confirm restore. The script never uses `--clean`, drops tables, or overwrites a database:
+The backup script reads `.env` privately, sets the password only in the child process environment (never command arguments or output), and verifies the custom-format archive. Protect the dump as confidential data. Restore creates only a new empty database and refuses to overwrite an existing database; if the restore fails, it drops only the new partial target it created:
 
 ```powershell
-.\deployment\Restore-Postgres.ps1 -BackupFile 'SET_TO_THE_PROTECTED_BACKUP.dump' -ConfirmRestore
+.\deployment\Restore-Postgres.ps1 -BackupFile 'D:\ApprovedBackups\REPro\repro_reports-20261124-120000.dump' -TargetDatabase 'repro_reports_recovery' -ConfirmTargetDatabase 'repro_reports_recovery'
+```
+
+For an approved update, test/select the full 40-character commit SHA first. `Update-LanDashboard.ps1` refuses dirty worktrees and non-fast-forward changes, fetches only the specified commit, takes a verified PostgreSQL backup, installs locked frontend/Python dependencies, builds production assets, restarts and health-checks the service, and attempts an application rollback if the health check fails. It is never scheduled and does not deploy the latest branch automatically. Review DB schema changes for backward compatibility; it preserves but does not automatically restore the pre-update backup during code rollback.
+
+```powershell
+.\deployment\Update-LanDashboard.ps1 -ProjectRoot (Get-Location).Path -ApprovedCommit '<approved-40-character-commit-sha>' -NssmPath 'C:\nssm\nssm.exe\win64\ssm.exe'
 ```
 
 ### Production verification status
